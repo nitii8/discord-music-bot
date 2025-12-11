@@ -1,200 +1,170 @@
-const { Client, GatewayIntentBits, Collection, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { Lavalink } = require('lavalink.js');
+// Simple music bot using discord.js v14 and @discordjs/voice
+// Purpose: a compact, readable example suitable for learning and light use.
+
 const fs = require('fs');
-require('dotenv').config();
+const path = require('path');
+const { Client, GatewayIntentBits } = require('discord.js');
+const {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
+} = require('@discordjs/voice');
+const ytdl = require('ytdl-core');
+const yts = require('yt-search');
+
+// Load configuration from config.json or environment
+const CONFIG_PATH = path.join(__dirname, '..', 'config.json');
+let config = {};
+try {
+  config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+} catch (err) {
+  // Fall back to environment variables; user should copy config.example.json -> config.json
+  config = { token: process.env.BOT_TOKEN, prefix: '!', ownerId: '' };
+}
+
+const PREFIX = config.prefix || '!';
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates,
   ],
 });
 
-client.commands = new Collection();
-client.players = new Collection();
-client.playlists = new Collection();
+// A single shared player; per-guild control kept in guildState map
+const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
+const guildState = new Map(); // guildId -> { connection, queue: [], playing, current }
 
-// Event Handler
-const eventFiles = fs.readdirSync('./events').filter(file => file.endsWith('.js'));
-for (const file of eventFiles) {
-  const event = require(`./events/${file}`);
-  if (event.once) {
-    client.once(event.name, (...args) => event.execute(...args));
-  } else {
-    client.on(event.name, (...args) => event.execute(...args));
-  }
+function ensureGuild(id) {
+  if (!guildState.has(id)) guildState.set(id, { queue: [], playing: false });
+  return guildState.get(id);
 }
 
-// Command Handler
-const commandFolders = fs.readdirSync('./commands');
-for (const folder of commandFolders) {
-  const commandFiles = fs.readdirSync(`./commands/${folder}`).filter(file => file.endsWith('.js'));
-  for (const file of commandFiles) {
-    const command = require(`./commands/${folder}/${file}`);
-    if ('data' in command && 'execute' in command) {
-      client.commands.set(command.data.name, command);
-    } else {
-      console.warn(`[WARNING] Command at ./commands/${folder}/${file} missing data or execute property`);
-    }
-  }
+function enqueue(guildId, track) {
+  const state = ensureGuild(guildId);
+  state.queue.push(track);
 }
 
-// Lavalink Player Setup
-const lavalink = new Lavalink({
-  hosts: [
-    {
-      host: process.env.LAVALINK_HOST || 'localhost',
-      port: parseInt(process.env.LAVALINK_PORT) || 2333,
-      password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
-    },
-  ],
-  send: (guild_id, packet) => {
-    const guild = client.guilds.cache.get(guild_id);
-    if (guild) guild.shard.send(packet);
-  },
-});
-
-client.lavalink = lavalink;
-
-// Music Queue Management
-class MusicPlayer {
-  constructor(guild) {
-    this.guild = guild;
-    this.queue = [];
-    this.nowPlaying = null;
-    this.isPlaying = false;
-    this.volume = 100;
-    this.loopMode = 'none'; // none, one, all
+async function playNext(guildId) {
+  const state = guildState.get(guildId);
+  if (!state) return;
+  const next = state.queue.shift();
+  if (!next) {
+    state.playing = false;
+    state.current = null;
+    return;
   }
 
-  addToQueue(track) {
-    this.queue.push(track);
-    return this.queue.length;
-  }
-
-  skip() {
-    if (this.queue.length > 0) {
-      this.nowPlaying = this.queue.shift();
-      return this.nowPlaying;
-    }
-    return null;
-  }
-
-  setLoopMode(mode) {
-    if (['none', 'one', 'all'].includes(mode)) {
-      this.loopMode = mode;
-      return true;
-    }
-    return false;
-  }
-
-  getQueue() {
-    return this.queue;
-  }
-
-  clearQueue() {
-    this.queue = [];
-  }
-
-  setVolume(vol) {
-    if (vol >= 0 && vol <= 200) {
-      this.volume = vol;
-      return true;
-    }
-    return false;
-  }
-}
-
-// Initialize Player
-function getOrCreatePlayer(guild) {
-  if (!client.players.has(guild.id)) {
-    client.players.set(guild.id, new MusicPlayer(guild));
-  }
-  return client.players.get(guild.id);
-}
-
-// Slash Command Interaction Handler
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  const command = client.commands.get(interaction.commandName);
-  if (!command) return;
-
+  state.playing = true;
   try {
-    await command.execute(interaction, client);
-  } catch (error) {
-    console.error(error);
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({ content: 'There was an error executing this command!', ephemeral: true });
-    } else {
-      await interaction.reply({ content: 'There was an error executing this command!', ephemeral: true });
+    const stream = ytdl(next.url, { filter: 'audioonly', quality: 'highestaudio', highWaterMark: 1 << 25 });
+    const resource = createAudioResource(stream, { inlineVolume: true });
+    if (resource.volume) resource.volume.setVolume(0.8);
+
+    player.play(resource);
+    state.current = next;
+
+    const onIdle = () => {
+      player.removeListener(AudioPlayerStatus.Idle, onIdle);
+      playNext(guildId);
+    };
+
+    player.once(AudioPlayerStatus.Idle, onIdle);
+  } catch (e) {
+    console.error('Playback error:', e);
+    playNext(guildId);
+  }
+}
+
+client.once('ready', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+});
+
+client.on('messageCreate', async (message) => {
+  if (!message.guild || message.author.bot) return;
+  if (!message.content.startsWith(PREFIX)) return;
+
+  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const cmd = args.shift().toLowerCase();
+
+  if (cmd === 'ping') return message.reply('Pong!');
+
+  if (cmd === 'help') {
+    return message.reply('Commands: !play <query|url>, !skip, !stop, !queue, !now');
+  }
+
+  if (cmd === 'play') {
+    const query = args.join(' ');
+    if (!query) return message.reply('Usage: !play <YouTube URL or search terms>');
+
+    const voiceChannel = message.member.voice.channel;
+    if (!voiceChannel) return message.reply('You need to be in a voice channel to play music.');
+
+    let url = null;
+    if (ytdl.validateURL(query)) url = query;
+    else {
+      const res = await yts(query);
+      if (res && res.videos && res.videos.length) url = res.videos[0].url;
     }
+
+    if (!url) return message.reply('No results found.');
+
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: message.guild.id,
+      adapterCreator: message.guild.voiceAdapterCreator,
+    });
+
+    connection.subscribe(player);
+
+    enqueue(message.guild.id, { title: query, url, requestedBy: message.author.tag });
+    message.channel.send(`Queued: ${url}`);
+
+    const state = ensureGuild(message.guild.id);
+    state.connection = connection;
+    if (!state.playing) playNext(message.guild.id);
+    return;
+  }
+
+  if (cmd === 'skip') {
+    player.stop();
+    return message.reply('Skipped.');
+  }
+
+  if (cmd === 'stop') {
+    const state = guildState.get(message.guild.id);
+    if (state && state.connection) {
+      state.queue = [];
+      state.playing = false;
+      player.stop();
+      try {
+        state.connection.destroy();
+      } catch (err) {}
+      guildState.delete(message.guild.id);
+    }
+    return message.reply('Stopped and left voice channel.');
+  }
+
+  if (cmd === 'queue') {
+    const state = guildState.get(message.guild.id);
+    if (!state || !state.queue.length) return message.reply('Queue is empty.');
+    const lines = state.queue.map((t, i) => `${i + 1}. ${t.title || t.url}`);
+    return message.reply(lines.join('\n'), { split: true });
+  }
+
+  if (cmd === 'now') {
+    const state = guildState.get(message.guild.id);
+    if (!state || !state.current) return message.reply('Nothing is playing.');
+    return message.reply(`Now playing: ${state.current.title || state.current.url} (requested by ${state.current.requestedBy})`);
   }
 });
 
-// Button Interaction Handler
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isButton()) return;
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection', err));
 
-  const playerId = interaction.customId.split('_')[0];
-  const player = client.players.get(interaction.guildId);
-
-  if (interaction.customId.includes('play')) {
-    if (!player) return interaction.reply({ content: 'No music playing!', ephemeral: true });
-    player.isPlaying = true;
-    await interaction.reply({ content: '\\u25b6\\ufe0f Resumed playback', ephemeral: true });
-  } else if (interaction.customId.includes('pause')) {
-    if (!player) return interaction.reply({ content: 'No music playing!', ephemeral: true });
-    player.isPlaying = false;
-    await interaction.reply({ content: '\\u23f8 Paused playback', ephemeral: true });
-  } else if (interaction.customId.includes('skip')) {
-    if (!player) return interaction.reply({ content: 'No music playing!', ephemeral: true });
-    const next = player.skip();
-    if (next) {
-      await interaction.reply({ content: `\\u23ed Skipped to: ${next.title}`, ephemeral: true });
-    } else {
-      await interaction.reply({ content: 'Queue is empty!', ephemeral: true });
-    }
-  } else if (interaction.customId.includes('stop')) {
-    if (!player) return interaction.reply({ content: 'No music playing!', ephemeral: true });
-    player.clearQueue();
-    player.nowPlaying = null;
-    player.isPlaying = false;
-    await interaction.reply({ content: '\\u23f9 Stopped music and cleared queue', ephemeral: true });
-  }
-});
-
-// Voice State Update (for leaving empty voice channels)
-client.on('voiceStateUpdate', (oldState, newState) => {
-  const voiceChannel = oldState.channel;
-  if (voiceChannel && voiceChannel.members.filter(m => !m.user.bot).size === 0) {
-    const player = client.players.get(voiceChannel.guild.id);
-    if (player) {
-      player.clearQueue();
-      player.isPlaying = false;
-      client.players.delete(voiceChannel.guild.id);
-    }
-  }
-});
-
-// Error Handling
-process.on('unhandledRejection', error => {
-  console.error('Unhandled Promise Rejection:', error);
-});
-
-process.on('uncaughtException', error => {
-  console.error('Uncaught Exception:', error);
-});
-
-// Graceful Shutdown
-process.on('SIGINT', () => {
-  console.log('Shutting down gracefully...');
-  client.destroy();
-  process.exit(0);
-});
-
-// Bot Login
-client.login(process.env.DISCORD_TOKEN);
+if (config.token) client.login(config.token);
+else if (process.env.BOT_TOKEN) client.login(process.env.BOT_TOKEN);
+else console.warn('No token found. Copy config.example.json -> config.json and add your bot token.');
